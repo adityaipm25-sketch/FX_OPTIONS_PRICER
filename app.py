@@ -64,17 +64,31 @@ SAMPLE_UNIVERSE = [
     "AAPL", "MSFT", "TSLA", "AMZN", "NVDA", "GOOGL", "META", "SPY", "QQQ", "EURUSD=X", "USDINR=X"
 ]
 
+def is_fx_symbol(s: str) -> bool:
+    # yfinance FX tickers often contain '=' (eg EURUSD=X) or are futures like 6E=F.
+    # Extend this predicate if you have other FX naming patterns you want to exclude.
+    return "=" in s or s.upper().endswith("=F") or s.upper().endswith("=X")
+
 def get_movers(universe: List[str] = SAMPLE_UNIVERSE):
     key = f"movers::{','.join(universe)}"
     cached = cache_get(_price_cache, key, 30)
     if cached:
         return cached
+
+    # --- FILTER OUT FX symbols so movers shows stocks/options only ---
+    stock_universe = [s for s in universe if not is_fx_symbol(s)]
+    # if filtering removed everything, fall back to original universe
+    if not stock_universe:
+        stock_universe = universe
+    # ---------------------------------------------------------------
+
     rows = []
     try:
-        data = yf.download(tickers=" ".join(universe), period="5d", interval="1d", group_by="ticker", threads=False, progress=False)
-        for s in universe:
+        data = yf.download(tickers=" ".join(stock_universe), period="5d", interval="1d",
+                           group_by="ticker", threads=False, progress=False)
+        for s in stock_universe:
             try:
-                if len(universe) == 1:
+                if len(stock_universe) == 1:
                     df = data
                 else:
                     df = data[s]
@@ -86,7 +100,7 @@ def get_movers(universe: List[str] = SAMPLE_UNIVERSE):
             except Exception:
                 pass
     except Exception:
-        for s in universe:
+        for s in stock_universe:
             try:
                 t = yf.Ticker(s)
                 hist = t.history(period="5d")
@@ -109,6 +123,7 @@ def get_movers(universe: List[str] = SAMPLE_UNIVERSE):
     result = {"gainers": gainers, "losers": losers, "active": active}
     cache_set(_price_cache, key, result)
     return result
+
 
 def norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
@@ -616,4 +631,3 @@ def index():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
-
