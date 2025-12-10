@@ -17,8 +17,22 @@ app = Flask(__name__)
 
 _price_cache = {}
 _chain_cache = {}
+_news_cache = {}
 _PRICE_TTL = 60
 _CHAIN_TTL = 600
+_NEWS_TTL = 3600
+
+NEWS_API_KEY = "005f0fd8d17d41f88bcfd33fbd7f4d09"
+
+# Currency ETF mapping
+CURRENCY_ETFS = {
+    "EUR": "FXE",    # Euro ETF
+    "GBP": "FXB",    # British Pound ETF
+    "JPY": "FXY",    # Japanese Yen ETF
+    "AUD": "FXA",    # Australian Dollar ETF
+    "CAD": "FXC",    # Canadian Dollar ETF
+    "CHF": "FXF",    # Swiss Franc ETF
+}
 
 def cache_get(cache, key, ttl):
     rec = cache.get(key)
@@ -32,6 +46,41 @@ def cache_get(cache, key, ttl):
 
 def cache_set(cache, key, val):
     cache[key] = (time.time(), val)
+
+def get_financial_news(query: str = "finance", limit: int = 10) -> List[dict]:
+    """Fetch financial news from NewsAPI"""
+    key = f"news::{query}"
+    cached = cache_get(_news_cache, key, _NEWS_TTL)
+    if cached:
+        return cached
+    
+    news_articles = []
+    try:
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": query,
+            "sortBy": "publishedAt",
+            "language": "en",
+            "apiKey": NEWS_API_KEY,
+            "pageSize": limit
+        }
+        resp = requests.get(url, params=params, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            articles = data.get("articles", [])
+            for article in articles:
+                news_articles.append({
+                    "title": article.get("title", ""),
+                    "url": article.get("url", ""),
+                    "source": article.get("source", {}).get("name", ""),
+                    "publishedAt": article.get("publishedAt", "")
+                })
+        cache_set(_news_cache, key, news_articles)
+        return news_articles
+    except Exception as e:
+        print("News fetch error:", e)
+        cache_set(_news_cache, key, [])
+        return []
 
 def get_ohlc_for_symbol(symbol: str, period: str = "1mo"):
     key = f"ohlc::{symbol}::{period}"
@@ -372,6 +421,111 @@ def get_yahoo_option_chain(symbol: str) -> Tuple[List[dict], List[dict]]:
         cache_set(_chain_cache, key, ([], []))
         return [], []
 
+def calculate_historical_volatility(symbol: str, period: str = "3mo") -> float:
+    """Calculate historical volatility from price returns"""
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period=period)
+        if hist.empty or len(hist) < 2:
+            return 0.15  # default
+        returns = hist["Close"].pct_change().dropna()
+        return float(returns.std() * math.sqrt(252))  # annualized
+    except Exception:
+        return 0.15
+
+def scenario_analysis(S, K, r, sigma, T, option_type="call", model="bs", q=0.0):
+    """Run scenario analysis with spot, vol, and rate changes"""
+    scenarios = {}
+    
+    # Base case
+    if model == "bs":
+        base_price = black_scholes_price(S, K, r, sigma, T, option_type=option_type, q=q)
+    else:
+        base_price = garman_kohlhagen_price(S, K, r, sigma, T, option_type=option_type)
+    
+    scenarios["base"] = {"S": S, "sigma": sigma, "r": r, "price": base_price, "pnl": 0}
+    
+    # Spot scenarios: -10%, -5%, +5%, +10%
+    for spot_chg in [-0.10, -0.05, 0.05, 0.10]:
+        S_new = S * (1 + spot_chg)
+        if model == "bs":
+            p = black_scholes_price(S_new, K, r, sigma, T, option_type=option_type, q=q)
+        else:
+            p = garman_kohlhagen_price(S_new, K, r, sigma, T, option_type=option_type)
+        pnl = p - base_price
+        scenarios[f"spot_{spot_chg:+.0%}"] = {"S": S_new, "sigma": sigma, "r": r, "price": p, "pnl": pnl}
+    
+    # Volatility scenarios: -20%, -10%, +10%, +20%
+    for vol_chg in [-0.20, -0.10, 0.10, 0.20]:
+        sigma_new = sigma * (1 + vol_chg)
+        if model == "bs":
+            p = black_scholes_price(S, K, r, sigma_new, T, option_type=option_type, q=q)
+        else:
+            p = garman_kohlhagen_price(S, K, r, sigma_new, T, option_type=option_type)
+        pnl = p - base_price
+        scenarios[f"vol_{vol_chg:+.0%}"] = {"S": S, "sigma": sigma_new, "r": r, "price": p, "pnl": pnl}
+    
+    # Rate scenarios: -50bps, +50bps
+    for rate_chg in [-0.005, 0.005]:
+        r_new = max(0, r + rate_chg)
+        if model == "bs":
+            p = black_scholes_price(S, K, r_new, sigma, T, option_type=option_type, q=q)
+        else:
+            p = garman_kohlhagen_price(S, K, r_new, sigma, T, option_type=option_type)
+        pnl = p - base_price
+        scenarios[f"rate_{rate_chg:+.0%}"] = {"S": S, "sigma": sigma, "r": r_new, "price": p, "pnl": pnl}
+    
+    return scenarios
+
+def compare_models(S, K, r, sigma, T, option_type="call", q=0.0, rd=None, rf=None, steps=100):
+    """Compare pricing across different models"""
+    comparison = {}
+    
+    # Black-Scholes
+    bs_price = black_scholes_price(S, K, r, sigma, T, option_type=option_type, q=q)
+    bs_g = bs_greeks(S, K, r, sigma, T, q=q)
+    comparison["Black-Scholes"] = {
+        "price": bs_price,
+        "delta": bs_g["delta_call"] if option_type == "call" else bs_g["delta_put"],
+        "gamma": bs_g["gamma"],
+        "vega": bs_g["vega"],
+        "theta": bs_g["theta_call"] if option_type == "call" else bs_g["theta_put"]
+    }
+    
+    # Binomial European
+    binomial_eur = binomial_tree_price(S, K, r, sigma, T, steps=steps, option_type=option_type, american=False, q=q)
+    comparison["Binomial (EU)"] = {
+        "price": binomial_eur,
+        "delta": bs_g["delta_call"] if option_type == "call" else bs_g["delta_put"],
+        "gamma": bs_g["gamma"],
+        "vega": bs_g["vega"],
+        "theta": bs_g["theta_call"] if option_type == "call" else bs_g["theta_put"]
+    }
+    
+    # Binomial American
+    binomial_amer = binomial_tree_price(S, K, r, sigma, T, steps=steps, option_type=option_type, american=True, q=q)
+    comparison["Binomial (AM)"] = {
+        "price": binomial_amer,
+        "delta": bs_g["delta_call"] if option_type == "call" else bs_g["delta_put"],
+        "gamma": bs_g["gamma"],
+        "vega": bs_g["vega"],
+        "theta": bs_g["theta_call"] if option_type == "call" else bs_g["theta_put"]
+    }
+    
+    # Garman-Kohlhagen (if FX)
+    if rd is not None and rf is not None:
+        gk_price = garman_kohlhagen_price(S, K, rd, rf, sigma, T, option_type=option_type)
+        gk_g = gk_greeks(S, K, rd, rf, sigma, T)
+        comparison["Garman-Kohlhagen"] = {
+            "price": gk_price,
+            "delta": gk_g["delta"],
+            "gamma": gk_g["gamma"],
+            "vega": gk_g["vega"],
+            "theta": gk_g["theta"]
+        }
+    
+    return comparison
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     chart_form = {"symbol": "AAPL", "period": "1mo"}
@@ -381,11 +535,17 @@ def index():
                "S": "", "K": "", "r": 0.05, "q": 0.0, "sigma": 0.2, "T": 1.0, "steps": 200}
     fx_chain_form = {"root": "", "contract": "", "apikey": ""}
     eq_chain_form = {"symbol": "", "expiry": "", "expiries": []}
+    
+    scenario_form = {"option_type": "call", "model": "bs", "symbol": "AAPL", "use_live_price": "yes",
+                     "S": "", "K": "", "r": 0.05, "q": 0.0, "sigma": 0.2, "T": 1.0}
+    comparison_form = {"option_type": "call", "symbol": "AAPL", "use_live_price": "yes",
+                       "S": "", "K": "", "r": 0.05, "q": 0.0, "sigma": 0.2, "T": 1.0, "steps": 100}
 
     active_tab = "chart"
     chart_data = None
     chart_error = None
     movers = get_movers()
+    news = get_financial_news("stock market", limit=10)
 
     fx_result = None
     fx_chart = None
@@ -400,6 +560,12 @@ def index():
 
     eq_chain_calls, eq_chain_puts = [], []
     eq_chain_error = None
+    
+    scenario_result = None
+    scenario_error = None
+    
+    comparison_result = None
+    comparison_error = None
 
     if request.method == "POST":
         tab_type = request.form.get("tab_type", "chart")
@@ -584,15 +750,29 @@ def index():
             active_tab = "fx_chain"
             fx_chain_form["root"] = request.form.get("fx_chain_root", "").strip()
             fx_chain_form["contract"] = request.form.get("fx_chain_contract", "").strip()
-            symbol_for_yahoo = fx_chain_form["contract"] or fx_chain_form["root"]
+            
+            # Map futures symbols to currency ETFs
+            symbol_input = fx_chain_form["contract"] or fx_chain_form["root"]
+            symbol_for_yahoo = symbol_input
+            
+            # Convert futures symbols to ETF equivalents
+            if symbol_input.upper() in CURRENCY_ETFS:
+                symbol_for_yahoo = CURRENCY_ETFS[symbol_input.upper()]
+            elif symbol_input.upper() == "6E=F":
+                symbol_for_yahoo = "FXE"
+            elif symbol_input.upper() == "6B=F":
+                symbol_for_yahoo = "FXB"
+            elif symbol_input.upper() == "6J=F":
+                symbol_for_yahoo = "FXY"
+            
             if not symbol_for_yahoo:
-                fx_chain_error = "Enter contract or root to fetch from Yahoo."
+                fx_chain_error = "Enter a valid currency symbol (EUR, GBP, JPY, etc.) or ETF symbol."
             else:
                 try:
                     calls, puts = get_yahoo_option_chain(symbol_for_yahoo)
                     fx_chain_calls, fx_chain_puts = calls, puts
                     if not calls and not puts:
-                        fx_chain_error = "No options found on Yahoo for that symbol."
+                        fx_chain_error = f"No options found for {symbol_for_yahoo}. Try: FXE (EUR), FXB (GBP), FXY (JPY), FXA (AUD), FXC (CAD)"
                 except Exception as e:
                     fx_chain_error = str(e)
         elif tab_type == "equity_chain":
@@ -617,15 +797,103 @@ def index():
                             eq_chain_puts = chain.puts.to_dict("records")
             except Exception as e:
                 eq_chain_error = f"Error fetching option chain: {e}"
+        elif tab_type == "scenario":
+            active_tab = "scenario"
+            scenario_form["option_type"] = request.form.get("scenario_option_type", scenario_form["option_type"])
+            scenario_form["model"] = request.form.get("scenario_model", scenario_form["model"])
+            scenario_form["symbol"] = request.form.get("scenario_symbol", scenario_form["symbol"]).strip()
+            scenario_form["use_live_price"] = request.form.get("scenario_use_live_price")
+            scenario_form["S"] = request.form.get("scenario_S", scenario_form["S"])
+            scenario_form["K"] = request.form.get("scenario_K", scenario_form["K"])
+            scenario_form["r"] = float(request.form.get("scenario_r", scenario_form["r"]) or 0.0)
+            scenario_form["q"] = float(request.form.get("scenario_q", scenario_form["q"]) or 0.0)
+            scenario_form["sigma"] = float(request.form.get("scenario_sigma", scenario_form["sigma"]) or 0.0)
+            scenario_form["T"] = float(request.form.get("scenario_T", scenario_form["T"]) or 0.0)
+            
+            S_used = None
+            if scenario_form["use_live_price"]:
+                try:
+                    t = yf.Ticker(scenario_form["symbol"])
+                    hist = t.history(period="5d")
+                    if hist is not None and not hist.empty:
+                        S_used = float(hist["Close"].iloc[-1])
+                        if not scenario_form["sigma"]:
+                            scenario_form["sigma"] = calculate_historical_volatility(scenario_form["symbol"])
+                except Exception:
+                    S_used = None
+            
+            if (not S_used) and scenario_form["S"]:
+                try:
+                    S_used = float(scenario_form["S"])
+                except Exception:
+                    S_used = None
+            
+            if S_used is None:
+                scenario_error = "Could not determine spot price — provide S or enable live price."
+            else:
+                try:
+                    K = float(scenario_form["K"]) if scenario_form["K"] else S_used
+                    scenarios = scenario_analysis(S_used, K, scenario_form["r"], scenario_form["sigma"], 
+                                                 scenario_form["T"], scenario_form["option_type"], 
+                                                 scenario_form["model"], scenario_form["q"])
+                    scenario_result = scenarios
+                except Exception as e:
+                    scenario_error = f"Error: {e}"
+        
+        elif tab_type == "comparison":
+            active_tab = "comparison"
+            comparison_form["option_type"] = request.form.get("comparison_option_type", comparison_form["option_type"])
+            comparison_form["symbol"] = request.form.get("comparison_symbol", comparison_form["symbol"]).strip()
+            comparison_form["use_live_price"] = request.form.get("comparison_use_live_price")
+            comparison_form["S"] = request.form.get("comparison_S", comparison_form["S"])
+            comparison_form["K"] = request.form.get("comparison_K", comparison_form["K"])
+            comparison_form["r"] = float(request.form.get("comparison_r", comparison_form["r"]) or 0.0)
+            comparison_form["q"] = float(request.form.get("comparison_q", comparison_form["q"]) or 0.0)
+            comparison_form["sigma"] = float(request.form.get("comparison_sigma", comparison_form["sigma"]) or 0.0)
+            comparison_form["T"] = float(request.form.get("comparison_T", comparison_form["T"]) or 0.0)
+            comparison_form["steps"] = int(request.form.get("comparison_steps", comparison_form["steps"]) or 100)
+            
+            S_used = None
+            if comparison_form["use_live_price"]:
+                try:
+                    t = yf.Ticker(comparison_form["symbol"])
+                    hist = t.history(period="5d")
+                    if hist is not None and not hist.empty:
+                        S_used = float(hist["Close"].iloc[-1])
+                        if not comparison_form["sigma"]:
+                            comparison_form["sigma"] = calculate_historical_volatility(comparison_form["symbol"])
+                except Exception:
+                    S_used = None
+            
+            if (not S_used) and comparison_form["S"]:
+                try:
+                    S_used = float(comparison_form["S"])
+                except Exception:
+                    S_used = None
+            
+            if S_used is None:
+                comparison_error = "Could not determine spot price — provide S or enable live price."
+            else:
+                try:
+                    K = float(comparison_form["K"]) if comparison_form["K"] else S_used
+                    comparison = compare_models(S_used, K, comparison_form["r"], comparison_form["sigma"],
+                                               comparison_form["T"], comparison_form["option_type"],
+                                               comparison_form["q"], steps=comparison_form["steps"])
+                    comparison_result = comparison
+                except Exception as e:
+                    comparison_error = f"Error: {e}"
 
     return render_template("index.html",
         active_tab=active_tab,
         chart_form=chart_form, chart_data=chart_data, chart_error=chart_error,
         movers=movers,
+        news=news,
         fx_form=fx_form, fx_result=fx_result, fx_chart=fx_chart, fx_error=fx_error,
         eq_form=eq_form, eq_result=eq_result, eq_chart=eq_chart, eq_error=eq_error,
         fx_chain_form=fx_chain_form, fx_chain_calls=fx_chain_calls, fx_chain_puts=fx_chain_puts, fx_chain_error=fx_chain_error,
-        eq_chain_form=eq_chain_form, eq_chain_calls=eq_chain_calls, eq_chain_puts=eq_chain_puts, eq_chain_error=eq_chain_error
+        eq_chain_form=eq_chain_form, eq_chain_calls=eq_chain_calls, eq_chain_puts=eq_chain_puts, eq_chain_error=eq_chain_error,
+        scenario_form=scenario_form, scenario_result=scenario_result, scenario_error=scenario_error,
+        comparison_form=comparison_form, comparison_result=comparison_result, comparison_error=comparison_error
     )
 
 if __name__ == "__main__":
